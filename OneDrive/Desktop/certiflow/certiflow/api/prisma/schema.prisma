@@ -1,0 +1,167 @@
+// STEP 1: the database. Postgres is the source of truth for everything.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CENTRE
+  OFFICER
+  QUALITY
+  STATE
+}
+
+enum BatchStatus {
+  DRAFT
+  DISTRICT_REVIEW
+  QUALITY_REVIEW
+  STATE_REVIEW
+  SENT_BACK
+  REJECTED
+  APPROVED
+}
+
+enum Stage {
+  DISTRICT
+  QUALITY
+  STATE
+}
+
+enum CertStatus {
+  VALID
+  REVOKED
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model District {
+  id      String   @id
+  name    String
+  centres Centre[]
+  users   User[]
+}
+
+model Centre {
+  id         String   @id
+  name       String
+  districtId String
+  district   District @relation(fields: [districtId], references: [id])
+  users      User[]
+  batches    Batch[]
+}
+
+model User {
+  id         String     @id
+  name       String
+  role       Role
+  districtId String?
+  district   District?  @relation(fields: [districtId], references: [id])
+  centreId   String?
+  centre     Centre?    @relation(fields: [centreId], references: [id])
+  approvals  Approval[]
+}
+
+model Batch {
+  id           String      @id @default(uuid())
+  name         String
+  centreId     String
+  centre       Centre      @relation(fields: [centreId], references: [id])
+  status       BatchStatus @default(DRAFT)
+  // A batch that is sent back and resubmitted starts a new round.
+  // Approvals belong to a round, so old approvals stop counting.
+  round        Int         @default(1)
+  lastReason   String?
+  // Reset on every action. Used to find batches that are stuck.
+  lastActionAt DateTime    @default(now())
+  escalatedAt  DateTime?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  candidates   Candidate[]
+  approvals    Approval[]
+
+  @@index([status])
+}
+
+model Candidate {
+  id          String       @id @default(uuid())
+  batchId     String
+  batch       Batch        @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  name        String
+  phone       String
+  course      String
+  grade       String
+  createdAt   DateTime     @default(now())
+  certificate Certificate?
+
+  @@index([batchId])
+}
+
+model Approval {
+  id        String   @id @default(uuid())
+  batchId   String
+  batch     Batch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  stage     Stage
+  round     Int
+  createdAt DateTime @default(now())
+
+  // The same officer can never approve the same batch twice in the same round.
+  @@unique([batchId, userId, stage, round])
+}
+
+model Certificate {
+  id               String         @id @default(uuid())
+  // Database counter -> certificate number PSM-000001. Two certificates can never share a number.
+  seq              Int            @unique @default(autoincrement())
+  // One certificate per candidate, guaranteed by the database.
+  candidateId      String         @unique
+  candidate        Candidate      @relation(fields: [candidateId], references: [id])
+  verifyCode       String
+  downloadToken    String         @unique
+  status           CertStatus     @default(VALID)
+  revokedReason    String?
+  revokedAt        DateTime?
+  pdfPath          String?
+  delivery         DeliveryStatus @default(PENDING)
+  deliveryAttempts Int            @default(0)
+  lastError        String?
+  sentAt           DateTime?
+  issuedAt         DateTime       @default(now())
+}
+
+// Every decision is written here: who, what, when. Never updated or deleted.
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actorName  String
+  actorRole  String
+  action     String
+  entityType String
+  entityId   String
+  batchId    String?
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([batchId])
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  role      Role
+  message   String
+  batchId   String?
+  createdAt DateTime @default(now())
+
+  @@index([role, createdAt])
+}

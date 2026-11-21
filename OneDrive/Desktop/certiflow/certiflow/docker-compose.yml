@@ -1,0 +1,97 @@
+# STEP 1: the whole system starts with one command:  docker compose up --build
+#
+# postgres       - the source of truth (batches, candidates, approvals, certificates, audit log)
+# redis          - job queue (BullMQ) + live updates (pub/sub) + verify cache
+# fake-whatsapp  - stand-in for WhatsApp that fails and times out on purpose
+# api            - Express API (runs migrations + demo data on start)
+# worker         - same code as api, but processes background jobs
+# web            - React app
+
+x-api-env: &api-env
+  DATABASE_URL: postgresql://certiflow:certiflow@postgres:5432/certiflow
+  TEST_DATABASE_URL: postgresql://certiflow:certiflow@postgres:5432/certiflow_test
+  REDIS_URL: redis://redis:6379/0
+  TEST_REDIS_URL: redis://redis:6379/1
+  JWT_SECRET: change-me-in-production
+  WHATSAPP_URL: http://fake-whatsapp:4000
+  WHATSAPP_TIMEOUT_MS: "5000"
+  PUBLIC_URL: http://localhost:5173
+  FILES_DIR: /data/certificates
+  STUCK_AFTER_SECONDS: "120"
+  BIG_BATCH_SIZE: "50"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: certiflow
+      POSTGRES_PASSWORD: certiflow
+      POSTGRES_DB: certiflow
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U certiflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # appendonly = Redis writes jobs to disk, so queued jobs survive a Redis restart
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  fake-whatsapp:
+    build: ./fake-whatsapp
+    environment:
+      FAIL_RATE: "0.3"   # 30% of sends fail with 503
+      SLOW_RATE: "0.1"   # 10% are delivered but answer too late (client times out)
+      SLOW_MS: "8000"
+    ports: ["4000:4000"]
+
+  api:
+    build: ./api
+    init: true
+    command: npm run start:api
+    environment: *api-env
+    ports: ["3000:3000"]
+    volumes: [certfiles:/data/certificates]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  worker:
+    build: ./api
+    init: true
+    command: npm run start:worker
+    environment: *api-env
+    volumes: [certfiles:/data/certificates]
+    depends_on:
+      api: { condition: service_healthy }   # wait until the api has run the migrations
+
+  web:
+    build: ./web
+    environment:
+      API_PROXY_TARGET: http://api:3000
+    ports: ["5173:5173"]
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
+  certfiles:
